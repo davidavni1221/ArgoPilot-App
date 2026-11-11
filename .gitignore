@@ -25,3 +25,6 @@ htmlcov/
 .idea/
 .vscode/*
 !.vscode/launch.json
+
+# Local database, created by services/registry-service/seed_registry.sh
+services/registry-service/registry.db
