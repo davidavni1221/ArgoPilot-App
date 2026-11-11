@@ -72,14 +72,20 @@ Example:
 
 ## Performance
 
-Measured at 10 requests per second for about 30 seconds per endpoint, against a copy of the seed database:
+Measured at 10 requests per second for 30 seconds per endpoint (about 300 requests each), against a copy of the seed database, from a single local client, with 0 errors:
 
 | Endpoint | p95 |
 |---|---|
-| GET /v1/farms | 5.0 ms |
-| GET /v1/farms/{id} | 5.3 ms |
-| GET /v1/plots | 4.7 ms |
-| GET /v1/plots/{id} | 6.2 ms |
+| GET /v1/farms | 11.1 ms |
+| GET /v1/farms/{id} | 12.2 ms |
+| GET /v1/plots | 12.8 ms |
+| GET /v1/plots/{id} | 11.9 ms |
+| GET /v1/crops | 10.9 ms |
+| GET /v1/crops/{id} | 11.4 ms |
+| GET /v1/soils | 12.1 ms |
+| GET /v1/soils/{id} | 11.7 ms |
+| GET /v1/emitters | 12.2 ms |
+| GET /v1/emitters/{id} | 11.9 ms |
 
 The target is p95 at or below 100 ms.
 
