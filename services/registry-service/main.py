@@ -1,5 +1,7 @@
 from fastapi import FastAPI, Depends, Request, Response
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
+from starlette.exceptions import HTTPException as StarletteHTTPException
 from datetime import date
 from typing import Optional
 import sqlite3
@@ -18,19 +20,47 @@ class APIError(Exception):
         self.title = title
         self.detail = detail
 
-@app.exception_handler(APIError)
-def api_error_handler(request: Request, exc: APIError):
+# פונקציה אחת שבונה את כל תגובות השגיאה, כדי שהפורמט יהיה זהה בכל מקום
+def problem_response(status_code: int, code: str, title: str, detail: str, headers: dict | None = None) -> JSONResponse:
     return JSONResponse(
-        status_code=exc.status_code,
+        status_code=status_code,
         content={
             "type": "about:blank",
-            "title": exc.title,
-            "status": exc.status_code,
-            "detail": exc.detail,
-            "code": exc.code
+            "title": title,
+            "status": status_code,
+            "detail": detail,
+            "code": code
         },
-        media_type="application/problem+json"
+        media_type="application/problem+json",
+        headers=headers,
     )
+
+@app.exception_handler(APIError)
+def api_error_handler(request: Request, exc: APIError):
+    return problem_response(exc.status_code, exc.code, exc.title, exc.detail)
+
+# שגיאות ש-FastAPI/Starlette מייצרים: נתיב לא קיים (404) או מתודה לא נתמכת (405)
+@app.exception_handler(StarletteHTTPException)
+def http_error_handler(request: Request, exc: StarletteHTTPException):
+    if exc.status_code == 404:
+        return problem_response(404, "NOT_FOUND", "Not Found", "Route not found")
+    if exc.status_code == 405:
+        return problem_response(405, "VALIDATION", "Method Not Allowed", "Method not allowed on this route")
+    return problem_response(exc.status_code, "VALIDATION", "Error", str(exc.detail))
+
+# ולידציה של גוף הבקשה או הפרמטרים (Pydantic)
+@app.exception_handler(RequestValidationError)
+def validation_error_handler(request: Request, exc: RequestValidationError):
+    details = []
+    for err in exc.errors():
+        field = ".".join(str(part) for part in err["loc"] if part not in ("body", "query", "path"))
+        details.append(f"{field}: {err['msg']}" if field else err["msg"])
+    return problem_response(422, "VALIDATION", "Unprocessable Entity", "; ".join(details))
+
+# כשל במסד הנתונים (קובץ חסר, נעול או לא נגיש) מוחזר כ-503 עם Retry-After
+@app.exception_handler(sqlite3.OperationalError)
+def db_unavailable_handler(request: Request, exc: sqlite3.OperationalError):
+    return problem_response(503, "UNAVAILABLE", "Service Unavailable", "Database is unavailable", headers={"Retry-After": "5"})
 
 # --- API Endpoints ---
 @app.get("/health")
@@ -97,7 +127,11 @@ def update_farm(id: str, farm_in: FarmUpdate, db: sqlite3.Connection = Depends(g
     row = db.execute("SELECT id, name FROM farms WHERE id = ?", (id,)).fetchone()
     if not row:
         raise APIError(404, "NOT_FOUND", "Not Found", "Farm not found")
-    
+
+    # שם החווה חובה: אם נשלח null במפורש, זו בקשה לא תקינה (לא "אין שינוי")
+    if "name" in farm_in.model_fields_set and farm_in.name is None:
+        raise APIError(422, "VALIDATION", "Unprocessable Entity", "Fields cannot be null: name")
+
     if farm_in.name is not None:
         db.execute("UPDATE farms SET name = ? WHERE id = ?", (farm_in.name, id))
         db.commit()
@@ -137,7 +171,11 @@ def create_plot(plot_in: PlotCreate, db: sqlite3.Connection = Depends(get_db)):
     if plot_in.planting_date > date.today():
         raise APIError(422, "VALIDATION", "Unprocessable Entity", "Planting date cannot be in the future")
         
-    # 2. בדיקה שהפריטים קיימים בקטלוגים
+    # 2. בדיקה שהחווה קיימת
+    if not db.execute("SELECT id FROM farms WHERE id = ?", (plot_in.farm_id,)).fetchone():
+        raise APIError(422, "VALIDATION", "Unprocessable Entity", "Unknown farm")
+
+    # 3. בדיקה שהפריטים קיימים בקטלוגים
     if not db.execute("SELECT id FROM crops WHERE id = ?", (plot_in.crop_id,)).fetchone():
         raise APIError(422, "VALIDATION", "Unprocessable Entity", "Unknown crop")
     if not db.execute("SELECT id FROM soils WHERE id = ?", (plot_in.soil_id,)).fetchone():
@@ -145,12 +183,12 @@ def create_plot(plot_in: PlotCreate, db: sqlite3.Connection = Depends(get_db)):
     if not db.execute("SELECT id FROM emitters WHERE id = ?", (plot_in.emitter_id,)).fetchone():
         raise APIError(422, "VALIDATION", "Unprocessable Entity", "Unknown emitter")
         
-    # 3. בדיקה שאין חלקה באותו שם באותה חווה
+    # 4. בדיקה שאין חלקה באותו שם באותה חווה
     existing = db.execute("SELECT id FROM plots WHERE farm_id = ? AND name = ?", (plot_in.farm_id, plot_in.name)).fetchone()
     if existing:
         raise APIError(409, "CONFLICT", "Conflict", "Duplicate plot name on the same farm")
         
-    # 4. שמירה במסד הנתונים
+    # 5. שמירה במסד הנתונים
     plot_id = str(uuid.uuid4())
     try:
         db.execute("""
@@ -178,7 +216,12 @@ def update_plot(id: str, plot_in: PlotUpdate, db: sqlite3.Connection = Depends(g
     update_data = plot_in.model_dump(exclude_unset=True)
     if not update_data:
         return dict(row)
-        
+
+    # כל השדות בחלקה חובה, לכן null אינו ערך חוקי (אחרת המסד יחזיר שגיאה ונקבל 500)
+    null_fields = [key for key, value in update_data.items() if value is None]
+    if null_fields:
+        raise APIError(422, "VALIDATION", "Unprocessable Entity", f"Fields cannot be null: {', '.join(null_fields)}")
+
     if "planting_date" in update_data and update_data["planting_date"] > date.today():
         raise APIError(422, "VALIDATION", "Unprocessable Entity", "Planting date cannot be in the future")
     if "crop_id" in update_data and not db.execute("SELECT id FROM crops WHERE id = ?", (update_data["crop_id"],)).fetchone():
